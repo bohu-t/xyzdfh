@@ -1,0 +1,19 @@
+services:
+  frontend:
+    ports:
+      - "18080:80"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  backend-web:
+    ports:
+      - "18089:8089"
+  websocket:
+    ports:
+      - "18090:8090"
+  scheduler:
+    ports:
+      - "18091:8091"

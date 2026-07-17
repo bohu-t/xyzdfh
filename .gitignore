@@ -1,0 +1,15 @@
+.env
+*.env
+*.log
+*.pyc
+__pycache__/
+node_modules/
+dist/
+.DS_Store
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+backups/
+static/uploads/
+backend-web/static/uploads/

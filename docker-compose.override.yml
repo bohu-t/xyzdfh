@@ -1,0 +1,48 @@
+services:
+  mysql:
+    networks:
+      macvlan_lan:
+        ipv4_address: 192.168.124.184
+      xianyu-network: {}
+
+  redis:
+    networks:
+      macvlan_lan:
+        ipv4_address: 192.168.124.185
+      xianyu-network: {}
+
+  backend-web:
+    environment:
+      - FRONTEND_PUBLIC_URL=http://192.168.124.180
+      - BACKEND_WEB_PUBLIC_URL=http://192.168.124.181:8089
+      - ENABLE_REMOTE_ADS=false
+      - ENABLE_REMOTE_ANNOUNCEMENTS=false
+      - ENABLE_REMOTE_POPUP_ANNOUNCEMENTS=false
+    networks:
+      macvlan_lan:
+        ipv4_address: 192.168.124.181
+      xianyu-network: {}
+
+  websocket:
+    networks:
+      macvlan_lan:
+        ipv4_address: 192.168.124.182
+      xianyu-network: {}
+
+  scheduler:
+    networks:
+      macvlan_lan:
+        ipv4_address: 192.168.124.183
+      xianyu-network: {}
+
+  frontend:
+    networks:
+      macvlan_lan:
+        ipv4_address: 192.168.124.180
+      xianyu-network: {}
+
+networks:
+  macvlan_lan:
+    external: true
+  xianyu-network:
+    driver: bridge
