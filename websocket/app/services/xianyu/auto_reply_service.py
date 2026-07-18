@@ -708,8 +708,8 @@ class AutoReplyService:
                         logger.info(f"【{self.cookie_id}】自动回复延迟 {reply_delay} 秒后发送")
                         await asyncio.sleep(reply_delay)
                     
-                    # 延迟结束后再次检测是否被人工介入暂停
-                    if pause_manager.is_chat_paused(chat_id, self.cookie_id):
+                    # 延迟结束后再次检测是否被人工介入暂停；关键词回复除外。
+                    if not log_payload.get("bypass_pause_for_keyword") and pause_manager.is_chat_paused(chat_id, self.cookie_id):
                         logger.info(f"【{self.cookie_id}】自动回复延迟结束，但检测到会话 {chat_id} 已被人工介入暂停，放弃发送回复")
                         log_payload["process_status"] = "skipped"
                         log_payload["decision_reason"] = "chat_paused_after_delay"
@@ -1097,16 +1097,9 @@ class AutoReplyService:
         """
         reply_trace = self._reply_trace_var.get()
         try:
-            if pause_manager.is_chat_paused(chat_id, self.cookie_id):
-                remaining = pause_manager.get_remaining_pause_time(chat_id, self.cookie_id)
-                logger.info(f"【{self.cookie_id}】chat_id {chat_id} 自动回复暂停中,剩余 {remaining} 秒")
-                if reply_trace is not None:
-                    reply_trace["process_status"] = "skipped"
-                    reply_trace["decision_reason"] = "chat_paused"
-                    reply_trace.setdefault("context_snapshot", {})["pause_remaining_seconds"] = remaining
-                return None
-            
             async with async_session_maker() as session:
+                # 关键词是买家明确指令（例如“体验账号”），优先级高于人工暂停；
+                # 暂停只拦截 AI/默认回复，不能拦截卡密/体验账号这类确定性发货回复。
                 keyword_reply = await self.get_keyword_reply(
                     session, send_user_name, send_user_id, send_message, item_id
                 )
@@ -1116,7 +1109,18 @@ class AutoReplyService:
                             reply_trace["process_status"] = "skipped"
                             reply_trace["decision_reason"] = "empty_reply"
                         return None
+                    if reply_trace is not None:
+                        reply_trace["bypass_pause_for_keyword"] = True
                     return keyword_reply
+
+                if pause_manager.is_chat_paused(chat_id, self.cookie_id):
+                    remaining = pause_manager.get_remaining_pause_time(chat_id, self.cookie_id)
+                    logger.info(f"【{self.cookie_id}】chat_id {chat_id} 自动回复暂停中,剩余 {remaining} 秒")
+                    if reply_trace is not None:
+                        reply_trace["process_status"] = "skipped"
+                        reply_trace["decision_reason"] = "chat_paused"
+                        reply_trace.setdefault("context_snapshot", {})["pause_remaining_seconds"] = remaining
+                    return None
                 
                 ai_reply = await self.get_ai_reply(
                     session, send_user_name, send_user_id, send_message, item_id, chat_id
