@@ -204,7 +204,6 @@ class NotificationManager:
             # 普通滑块/验证过程不再推送，避免每验证一次就钉钉刷屏。
             muted_types = {
                 "captcha_success_auto_update",
-                "captcha_max_retries_exceeded",
                 "captcha_dependency_missing",
                 "face_verification_required",
                 "face_verification_timeout",
@@ -244,7 +243,8 @@ class NotificationManager:
                 return
 
             qr_info = None
-            if notification_type in {"account_invalid", "account_disabled"}:
+            qr_relogin_types = {"account_invalid", "account_disabled", "captcha_max_retries_exceeded"}
+            if notification_type in qr_relogin_types:
                 qr_info = await self._create_relogin_qr()
 
             from common.db.compat import db_manager
