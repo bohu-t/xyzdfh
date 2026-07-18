@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import traceback
 from typing import Optional, List, Dict, Any
@@ -31,6 +32,7 @@ from common.models.default_reply import DefaultReply, DefaultReplyRecord
 from common.models.xy_order import XYOrder
 from common.db.session import async_session_maker
 from common.db.redis_client import distributed_lock
+from common.db.compat import db_manager
 from common.utils.default_reply_api import call_reply_api
 
 from app.services.xianyu.resource_manager import pause_manager
@@ -1220,12 +1222,13 @@ class AutoReplyService:
                             return "EMPTY_REPLY"
                         
                         try:
-                            formatted = reply.format(
+                            formatted = await self._render_keyword_reply(
+                                reply,
                                 send_user_name=send_user_name,
                                 send_user_id=send_user_id,
                                 send_message=send_message,
-                                item_id=item_id or "",
-                            )
+                                item_id=item_id,
+                                )
                             logger.info(f"商品ID文本关键词回复: {formatted}")
                             if reply_trace is not None:
                                 reply_trace["reply_mode"] = "text"
@@ -1275,12 +1278,13 @@ class AutoReplyService:
                         return "EMPTY_REPLY"
 
                     try:
-                        formatted = reply.format(
+                        formatted = await self._render_keyword_reply(
+                            reply,
                             send_user_name=send_user_name,
                             send_user_id=send_user_id,
                             send_message=send_message,
-                            item_id=item_id or "",
-                        )
+                            item_id=item_id,
+                            )
                         logger.info(f"通用文本关键词回复: {formatted}")
                         if reply_trace is not None:
                             reply_trace["reply_mode"] = "text"
@@ -1302,6 +1306,71 @@ class AutoReplyService:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】获取关键词回复失败: {e}")
             return None
+
+
+    async def _render_keyword_reply(
+        self,
+        reply: str,
+        *,
+        send_user_name: str,
+        send_user_id: str,
+        send_message: str,
+        item_id: Optional[str],
+    ) -> Optional[str]:
+        """渲染关键词回复，支持从批量数据卡券消费一行。
+
+        占位符：
+        - {consume_card:18}：从卡券 18 消费一行，原样插入
+        - {consume_card_csv:18}：从卡券 18 消费一行 CSV，按 username/password/duration_hours/points/max_hosts 拆字段
+        """
+        if not reply:
+            return reply
+
+        fields: Dict[str, str] = {}
+        csv_match = re.search(r"\{consume_card_csv:(\d+)\}", reply)
+        raw_match = re.search(r"\{consume_card:(\d+)\}", reply)
+
+        if csv_match:
+            card_id = int(csv_match.group(1))
+            consumed = db_manager.consume_batch_data(card_id)
+            if not consumed:
+                logger.warning(f"关键词回复卡券库存不足: card_id={card_id}")
+                return "体验账号库存已发完，请稍后联系卖家补充。"
+            parts = [part.strip() for part in consumed.split(",")]
+            fields.update({
+                "trial_username": parts[0] if len(parts) > 0 else "",
+                "trial_password": parts[1] if len(parts) > 1 else "",
+                "trial_duration_hours": parts[2] if len(parts) > 2 else "",
+                "trial_points": parts[3] if len(parts) > 3 else "",
+                "trial_max_hosts": parts[4] if len(parts) > 4 else "",
+                "trial_raw": consumed,
+            })
+            # 占位符只用于触发消费，不直接把 CSV 原文发给买家。
+            reply = reply.replace(csv_match.group(0), "")
+            try:
+                db_manager.increment_delivery_count(card_id)
+            except Exception as e:
+                logger.warning(f"关键词回复增加卡券发货次数失败: card_id={card_id}, error={e}")
+        elif raw_match:
+            card_id = int(raw_match.group(1))
+            consumed = db_manager.consume_batch_data(card_id)
+            if not consumed:
+                logger.warning(f"关键词回复卡券库存不足: card_id={card_id}")
+                return "体验账号库存已发完，请稍后联系卖家补充。"
+            fields["trial_raw"] = consumed
+            reply = reply.replace(raw_match.group(0), consumed)
+            try:
+                db_manager.increment_delivery_count(card_id)
+            except Exception as e:
+                logger.warning(f"关键词回复增加卡券发货次数失败: card_id={card_id}, error={e}")
+
+        return reply.format(
+            send_user_name=send_user_name,
+            send_user_id=send_user_id,
+            send_message=send_message,
+            item_id=item_id or "",
+            **fields,
+        )
 
     async def _list_keywords(self, session: AsyncSession, account: XYAccount) -> list[dict]:
         """获取关键词列表（参照旧框架，添加is_active条件）"""
