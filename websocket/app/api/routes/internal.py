@@ -551,6 +551,12 @@ async def send_message(account_id: str, request: SendMessageRequest):
             send_user_id=None,  # 由实例内部获取
             content=request.message,
         )
+        if isinstance(send_result, dict) and send_result.get("success"):
+            try:
+                from app.services.xianyu.resource_manager import pause_manager
+                pause_manager.mark_auto_sent_message(request.chat_id, account_id, request.message)
+            except Exception as mark_e:
+                logger.warning(f"记录内部发送消息回流标记失败: {mark_e}")
 
         # WebSocket 发送层失败：直接判失败
         if not isinstance(send_result, dict) or not send_result.get("success"):

@@ -580,6 +580,17 @@ class AutoReplyService:
             myid = getattr(self.xianyu_instance, 'myid', self.cookie_id)
             self._merge_log_context(log_payload, myid=myid)
             if send_user_id == myid:
+                # 自己发出的消息会包含两类：
+                # 1) 系统自动回复/自动发货发送后的 WebSocket 回流；
+                # 2) 卖家真正手动发送的消息。
+                # 只有第 2 类才应该暂停自动回复；否则自动回复一次后会误暂停该会话，
+                # 导致买家后续追问（尤其已下单买家）不再触发 AI。
+                if pause_manager.consume_auto_sent_message(chat_id, self.cookie_id, send_message):
+                    logger.info(f"【{self.cookie_id}】检测到自动发送消息回流，不暂停自动回复: {send_message[:30]}...")
+                    log_payload["process_status"] = "skipped"
+                    log_payload["decision_reason"] = "auto_sent_echo"
+                    return
+
                 # 手动发出消息，暂停该会话的自动回复
                 log_payload["process_status"] = "skipped"
                 log_payload["decision_reason"] = "self_message"
@@ -936,6 +947,8 @@ class AutoReplyService:
                     send_user_id=send_user_id,
                     content=msg,
                 )
+                if isinstance(result, dict) and result.get("success"):
+                    pause_manager.mark_auto_sent_message(chat_id, self.cookie_id, msg)
                 send_results.append(result or self._build_empty_send_result("text", msg))
                 logger.info(f"【{self.cookie_id}】发送文本回复 {i+1}/{len(messages)}: {msg[:50]}...")
                  
@@ -950,6 +963,8 @@ class AutoReplyService:
                 send_user_id=send_user_id,
                 content=text,
             )
+            if isinstance(result, dict) and result.get("success"):
+                pause_manager.mark_auto_sent_message(chat_id, self.cookie_id, text)
             send_results.append(result or self._build_empty_send_result("text", text))
             logger.info(f"【{self.cookie_id}】发送文本回复: {text[:50]}...")
 
@@ -1794,15 +1809,19 @@ class AutoReplyService:
             if not account:
                 return None
             
-            # 【新增】检查是否开启"已下单用户禁止AI回复"开关
+            # 检查是否开启“已下单用户禁止AI回复”开关。
+            # 注意：只能按“当前商品/当前会话对应订单”拦截，不能按买家历史订单全局拦截；
+            # 否则买过 A 商品的人再咨询 B 商品时也会被错误跳过 AI。
             if account.ai_reply_block_ordered_users:
-                # 检查该买家是否在订单表中有订单记录
-                has_orders = await self._check_user_has_orders(session, send_user_id)
-                if has_orders:
-                    logger.info(f"【{self.cookie_id}】用户 {send_user_id} 已下单，跳过AI回复（ai_reply_block_ordered_users=True）")
+                has_current_item_order = await self._check_user_has_orders(session, send_user_id, item_id, chat_id)
+                if has_current_item_order:
+                    logger.info(
+                        f"【{self.cookie_id}】用户 {send_user_id} 已购买当前商品/会话，"
+                        "跳过AI回复（ai_reply_block_ordered_users=True）"
+                    )
                     if reply_trace is not None:
-                        reply_trace.setdefault("context_snapshot", {})["ai_blocked_reason"] = "ordered_user"
-                        reply_trace.setdefault("context_snapshot", {})["buyer_has_orders"] = True
+                        reply_trace.setdefault("context_snapshot", {})["ai_blocked_reason"] = "ordered_current_item"
+                        reply_trace.setdefault("context_snapshot", {})["buyer_has_current_item_order"] = True
                     return None  # 返回None，流程会自动进入默认回复判断
             
             ai_engine = get_ai_reply_engine()
@@ -1888,35 +1907,55 @@ class AutoReplyService:
             logger.error(f"【{self.cookie_id}】获取AI回复失败: {e}")
             return None
 
-    async def _check_user_has_orders(self, session: AsyncSession, buyer_user_id: str) -> bool:
-        """检查指定买家在当前账号下是否有订单记录
+    async def _check_user_has_orders(
+        self,
+        session: AsyncSession,
+        buyer_user_id: str,
+        item_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> bool:
+        """检查指定买家在当前账号下是否有当前商品/当前会话的订单记录
         
         Args:
             session: 数据库会话
             buyer_user_id: 买家用户ID
+            item_id: 当前咨询商品ID
+            chat_id: 当前聊天会话ID
             
         Returns:
-            True表示有订单，False表示无订单
+            True表示当前商品/当前会话已有订单，False表示无相关订单
         """
         try:
             # 防御性检查：买家ID为空时直接返回False
             if not buyer_user_id or not buyer_user_id.strip():
                 logger.info(f"【{self.cookie_id}】买家ID为空，跳过订单检查")
                 return False
-            
-            # 检查订单表中是否存在该买家的订单记录
-            # 使用 account_id 字段匹配卖家账号（对应订单表的 seller_account_id）
-            # 注意：account_id 和 buyer_id 都可能为 None，需要显式排除
-            stmt = select(exists().where(
+
+            filters = [
                 XYOrder.account_id == self.cookie_id,
                 XYOrder.buyer_id == buyer_user_id,
                 XYOrder.account_id.isnot(None),  # 显式排除 account_id 为空的记录
                 XYOrder.buyer_id.isnot(None),    # 显式排除 buyer_id 为空的记录
-            ))
+            ]
+
+            # 优先按当前商品判断；无商品ID时才退回当前会话判断。
+            # 这样“买过的人咨询其他商品/其他订单”不会被历史订单误伤。
+            if item_id:
+                filters.append(XYOrder.item_id == item_id)
+            elif chat_id:
+                filters.append(XYOrder.chat_id == chat_id)
+            else:
+                logger.info(f"【{self.cookie_id}】缺少 item_id/chat_id，跳过已下单AI拦截检查")
+                return False
+
+            stmt = select(exists().where(*filters))
             result = await session.execute(stmt)
             has_orders = result.scalar()
             
-            logger.info(f"【{self.cookie_id}】检查买家 {buyer_user_id} 订单记录: {has_orders}")
+            logger.info(
+                f"【{self.cookie_id}】检查买家 {buyer_user_id} 当前商品/会话订单记录: "
+                f"{has_orders}, item_id={item_id}, chat_id={chat_id}"
+            )
             return bool(has_orders)
             
         except Exception as e:

@@ -1645,8 +1645,15 @@ class XianyuAsync:
                 # 再发送文字（如果有）
                 if has_content:
                     try:
-                        await self.send_msg(websocket, chat_id, send_user_id, config.message_content.strip())
-                        logger.info(f"[{msg_time}] 【确认收货消息发出】用户: {send_user_name}, 商品({item_id}): {config.message_content.strip()[:50]}...")
+                        content = config.message_content.strip()
+                        result = await self.send_msg(websocket, chat_id, send_user_id, content)
+                        if isinstance(result, dict) and result.get("success"):
+                            try:
+                                from app.services.xianyu.resource_manager import pause_manager
+                                pause_manager.mark_auto_sent_message(chat_id, self.cookie_id, content)
+                            except Exception as mark_e:
+                                logger.warning(f"【{self.cookie_id}】记录确认收货自动消息回流标记失败: {self._safe_str(mark_e)}")
+                        logger.info(f"[{msg_time}] 【确认收货消息发出】用户: {send_user_name}, 商品({item_id}): {content[:50]}...")
                     except Exception as msg_error:
                         logger.error(f"[{msg_time}] 【{self.cookie_id}】发送确认收货消息失败: {msg_error}")
                         

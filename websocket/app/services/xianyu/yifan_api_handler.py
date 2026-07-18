@@ -1,4 +1,4 @@
-﻿"""
+"""
 亦凡API处理模块
 负责处理亦凡卡券API相关的所有逻辑，包括：
 - 亦凡API卡券获取
@@ -347,7 +347,13 @@ class YifanApiHandler:
             
             # 发送询问消息
             ask_message = "请单独发送您的充值账号，不要有任何其他的文字。如果因为您输错的原因导致错误下单，概不退款。"
-            await self.send_msg(self.ws, chat_id, buyer_id, ask_message)
+            result = await self.send_msg(self.ws, chat_id, buyer_id, ask_message)
+            if isinstance(result, dict) and result.get("success"):
+                try:
+                    from app.services.xianyu.resource_manager import pause_manager
+                    pause_manager.mark_auto_sent_message(chat_id, self.cookie_id, ask_message)
+                except Exception as mark_e:
+                    logger.warning(f"【{self.cookie_id}】记录一番赏询问消息回流标记失败: {mark_e}")
             logger.info(f"已发送充值账号询问消息，等待用户回复")
             
             # 返回特殊标记，表示需要等待用户输入

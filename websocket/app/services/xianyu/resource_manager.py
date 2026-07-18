@@ -1,4 +1,4 @@
-﻿"""
+"""
 资源管理模块
 
 功能:
@@ -30,6 +30,37 @@ class AutoReplyPauseManager:
         # key: (cookie_id, chat_id) 元组，value: pause_until_timestamp
         # 设计要点：暂停必须按账号隔离，避免账号A对某个chat手动回复后账号B在相同chat上也被误暂停
         self.paused_chats: dict[tuple[str, str], float] = {}
+        # 自动回复/自动发货发出的消息也会经 WebSocket 回流成“自己发出的消息”。
+        # 这些回流不能当成人工介入，否则会把刚自动回复过的会话暂停，导致买家后续消息不触发 AI。
+        # key: (cookie_id, chat_id, content)，value: expire_timestamp
+        self.auto_sent_messages: dict[tuple[str, str, str], float] = {}
+
+    def mark_auto_sent_message(self, chat_id: str, cookie_id: str, content: str, ttl_seconds: int = 120):
+        """记录一条系统自动发出的消息，用于识别稍后回流的 self_message。"""
+        if not chat_id or not cookie_id or content is None:
+            return
+        self.cleanup_expired_auto_sent_messages()
+        key = (cookie_id, chat_id, str(content).strip())
+        self.auto_sent_messages[key] = time.time() + ttl_seconds
+
+    def consume_auto_sent_message(self, chat_id: str, cookie_id: str, content: str) -> bool:
+        """如果当前 self_message 是自动发送消息的回流，则消费记录并返回 True。"""
+        if not chat_id or not cookie_id or content is None:
+            return False
+        self.cleanup_expired_auto_sent_messages()
+        key = (cookie_id, chat_id, str(content).strip())
+        if key in self.auto_sent_messages:
+            del self.auto_sent_messages[key]
+            return True
+        return False
+
+    def cleanup_expired_auto_sent_messages(self):
+        """清理已过期的自动发送消息记录。"""
+        current_time = time.time()
+        expired_keys = [key for key, expire_at in self.auto_sent_messages.items()
+                        if current_time >= expire_at]
+        for key in expired_keys:
+            del self.auto_sent_messages[key]
 
     def pause_chat(self, chat_id: str, cookie_id: str):
         """暂停指定chat_id的自动回复,使用账号特定的暂停时间
@@ -113,6 +144,7 @@ class AutoReplyPauseManager:
 
         for key in expired_keys:
             del self.paused_chats[key]
+        self.cleanup_expired_auto_sent_messages()
 
 
 # 全局暂停管理器实例

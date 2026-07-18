@@ -214,6 +214,11 @@ class AutoDeliveryHandler:
         for attempt in range(max_retries + 1):
             result = await self.send_msg(current_ws, chat_id, send_user_id, content)
             if isinstance(result, dict) and result.get("success"):
+                try:
+                    from app.services.xianyu.resource_manager import pause_manager
+                    pause_manager.mark_auto_sent_message(chat_id, self.cookie_id, content)
+                except Exception as mark_e:
+                    logger.warning(f"【{self.cookie_id}】记录自动发货消息回流标记失败: {self._safe_str(mark_e)}")
                 if attempt > 0:
                     logger.info(f"【{self.cookie_id}】消息重试第{attempt}次发送成功: {content[:30]}...")
                 return result
