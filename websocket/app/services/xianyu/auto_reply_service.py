@@ -1332,7 +1332,9 @@ class AutoReplyService:
 
         if csv_match:
             card_id = int(csv_match.group(1))
-            consumed = db_manager.consume_batch_data(card_id)
+            consumed = await self._consume_keyword_card_once(card_id, send_user_id, item_id)
+            if consumed == "__ALREADY_CLAIMED__":
+                return "您已领取过体验账号，每个买家仅限体验一次。如需继续使用，请购买正式套餐。"
             if not consumed:
                 logger.warning(f"关键词回复卡券库存不足: card_id={card_id}")
                 return "体验账号库存已发完，请稍后联系卖家补充。"
@@ -1353,7 +1355,9 @@ class AutoReplyService:
                 logger.warning(f"关键词回复增加卡券发货次数失败: card_id={card_id}, error={e}")
         elif raw_match:
             card_id = int(raw_match.group(1))
-            consumed = db_manager.consume_batch_data(card_id)
+            consumed = await self._consume_keyword_card_once(card_id, send_user_id, item_id)
+            if consumed == "__ALREADY_CLAIMED__":
+                return "您已领取过体验账号，每个买家仅限体验一次。如需继续使用，请购买正式套餐。"
             if not consumed:
                 logger.warning(f"关键词回复卡券库存不足: card_id={card_id}")
                 return "体验账号库存已发完，请稍后联系卖家补充。"
@@ -1371,6 +1375,83 @@ class AutoReplyService:
             item_id=item_id or "",
             **fields,
         )
+
+
+    async def _ensure_keyword_card_claims_table(self):
+        """确保关键词卡券领取记录表存在，用于限制同一买家只领一次体验账号。"""
+        create_sql = text(
+            "CREATE TABLE IF NOT EXISTS xy_keyword_card_claims ("
+            "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+            "card_id BIGINT NOT NULL, "
+            "buyer_id VARCHAR(128) NOT NULL, "
+            "item_id VARCHAR(64) DEFAULT '', "
+            "account_id VARCHAR(128) DEFAULT '', "
+            "consumed_data TEXT NULL, "
+            "created_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, "
+            "UNIQUE KEY uq_keyword_card_buyer (card_id, buyer_id), "
+            "KEY idx_keyword_card_claims_item (item_id), "
+            "KEY idx_keyword_card_claims_account (account_id)"
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        )
+        async with async_session_maker() as session:
+            await session.execute(create_sql)
+            await session.commit()
+
+    async def _consume_keyword_card_once(self, card_id: int, buyer_id: str, item_id: Optional[str]) -> Optional[str]:
+        """按买家限制关键词卡券只领取一次；成功时消费并记录一条库存。"""
+        if not buyer_id:
+            return db_manager.consume_batch_data(card_id)
+
+        try:
+            await self._ensure_keyword_card_claims_table()
+            insert_stmt = text(
+                "INSERT IGNORE INTO xy_keyword_card_claims "
+                "(card_id, buyer_id, item_id, account_id) "
+                "VALUES (:card_id, :buyer_id, :item_id, :account_id)"
+            )
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    insert_stmt,
+                    {
+                        "card_id": card_id,
+                        "buyer_id": buyer_id,
+                        "item_id": item_id or "",
+                        "account_id": self.cookie_id or "",
+                    },
+                )
+                await session.commit()
+                if result.rowcount == 0:
+                    logger.info(f"关键词卡券重复领取拦截: card_id={card_id}, buyer_id={buyer_id}")
+                    return "__ALREADY_CLAIMED__"
+
+            consumed = db_manager.consume_batch_data(card_id)
+            if not consumed:
+                # 库存不足时回滚本次领取记录，避免买家在补库存后仍被误判已领取。
+                async with async_session_maker() as session:
+                    await session.execute(
+                        text(
+                            "DELETE FROM xy_keyword_card_claims "
+                            "WHERE card_id=:card_id AND buyer_id=:buyer_id AND consumed_data IS NULL"
+                        ),
+                        {"card_id": card_id, "buyer_id": buyer_id},
+                    )
+                    await session.commit()
+                return None
+
+            async with async_session_maker() as session:
+                await session.execute(
+                    text(
+                        "UPDATE xy_keyword_card_claims SET consumed_data=:consumed_data "
+                        "WHERE card_id=:card_id AND buyer_id=:buyer_id"
+                    ),
+                    {"consumed_data": consumed, "card_id": card_id, "buyer_id": buyer_id},
+                )
+                await session.commit()
+            return consumed
+        except Exception as e:
+            logger.error(f"关键词卡券一次性领取处理失败: card_id={card_id}, buyer_id={buyer_id}, error={e}")
+            return None
 
     async def _list_keywords(self, session: AsyncSession, account: XYAccount) -> list[dict]:
         """获取关键词列表（参照旧框架，添加is_active条件）"""
