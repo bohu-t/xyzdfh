@@ -1809,20 +1809,8 @@ class AutoReplyService:
             if not account:
                 return None
             
-            # 检查是否开启“已下单用户禁止AI回复”开关。
-            # 注意：只能按“当前商品/当前会话对应订单”拦截，不能按买家历史订单全局拦截；
-            # 否则买过 A 商品的人再咨询 B 商品时也会被错误跳过 AI。
-            if account.ai_reply_block_ordered_users:
-                has_current_item_order = await self._check_user_has_orders(session, send_user_id, item_id, chat_id)
-                if has_current_item_order:
-                    logger.info(
-                        f"【{self.cookie_id}】用户 {send_user_id} 已购买当前商品/会话，"
-                        "跳过AI回复（ai_reply_block_ordered_users=True）"
-                    )
-                    if reply_trace is not None:
-                        reply_trace.setdefault("context_snapshot", {})["ai_blocked_reason"] = "ordered_current_item"
-                        reply_trace.setdefault("context_snapshot", {})["buyer_has_current_item_order"] = True
-                    return None  # 返回None，流程会自动进入默认回复判断
+            # 买家下单后仍可能咨询售后/使用问题，因此 AI 回复不再因订单记录被拦截。
+            # 历史开关 ai_reply_block_ordered_users 保留在配置/接口中兼容旧数据，但此处不再生效。
             
             ai_engine = get_ai_reply_engine()
             if not await ai_engine.is_ai_enabled(self.cookie_id, session):
