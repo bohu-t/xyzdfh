@@ -11,6 +11,7 @@
 import time
 import asyncio
 import hashlib
+import aiohttp
 from loguru import logger
 
 from common.utils.notification_utils import (
@@ -200,8 +201,22 @@ class NotificationManager:
             verification_url: 验证链接（可选）
         """
         try:
-            # 检查是否是正常的令牌过期，跳过通知
-            if self._is_normal_token_expiry(error_message):
+            # 普通滑块/验证过程不再推送，避免每验证一次就钉钉刷屏。
+            muted_types = {
+                "captcha_success_auto_update",
+                "captcha_max_retries_exceeded",
+                "captcha_dependency_missing",
+                "face_verification_required",
+                "face_verification_timeout",
+                "baxia_punish_captcha",
+                "password_login_verification",
+            }
+            if notification_type in muted_types:
+                logger.info(f"验证过程通知已静音: type={notification_type}, message={error_message}")
+                return
+
+            # 正常可自动恢复的令牌过期不通知；只有账号/Cookie 确定失效时才发续登二维码。
+            if self._is_normal_token_expiry(error_message) and notification_type not in {"account_invalid", "account_disabled"}:
                 logger.warning(f"检测到正常的令牌过期，跳过通知: {error_message}")
                 return
 
@@ -227,6 +242,10 @@ class NotificationManager:
                     time_desc = f"{remaining_minutes}分钟"
                 logger.warning(f"Token刷新通知在冷却期内，跳过发送 (还需等待 {time_desc})")
                 return
+
+            qr_info = None
+            if notification_type in {"account_invalid", "account_disabled"}:
+                qr_info = await self._create_relogin_qr()
 
             from common.db.compat import db_manager
             notifications = db_manager.get_account_notifications(self.cookie_id)
@@ -277,8 +296,22 @@ class NotificationManager:
                 notification_msg = f"{notification_title}\n\n{error_message}\n\n闲鱼账号: {account_desc}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             elif verification_url:
                 notification_msg = f"{notification_title}\n\n{error_message}\n\n闲鱼账号: {account_desc}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n验证链接: {verification_url}\n"
+            elif qr_info:
+                qr_image_url = qr_info.get("qr_image_url") or ""
+                session_id = qr_info.get("session_id") or ""
+                qr_line = f"\n\n![扫码登录二维码]({qr_image_url})\n\n二维码链接: {qr_image_url}" if qr_image_url else ""
+                notification_msg = (
+                    f"{notification_title}\n\n"
+                    f"闲鱼账号: {account_desc}\n"
+                    f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"详情: {error_message}\n\n"
+                    f"Token/Cookie 已失效，请使用闲鱼 App 扫描下方二维码重新登录。"
+                    f"扫码成功后系统会自动更新 Cookie 并重启该账号连接。"
+                    f"{qr_line}\n\n"
+                    f"会话ID: {session_id}\n"
+                )
             else:
-                notification_msg = f"{notification_title}\n\n闲鱼账号: {account_desc}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n详情: {error_message}\n\n请检查账号状态。\n"
+                notification_msg = f"{notification_title}\n\n闲鱼账号: {account_desc}\n时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n详情: {error_message}\n\n请打开账号管理重新扫码登录。\n"
 
             notification_sent = await self._send_to_channels(notifications, notification_msg, attachment_path)
 
@@ -289,6 +322,28 @@ class NotificationManager:
 
         except Exception as e:
             logger.error(f"处理Token刷新通知失败: {self._safe_str(e)}")
+
+
+    async def _create_relogin_qr(self) -> dict | None:
+        """调用 backend 生成指定账号续登二维码。"""
+        try:
+            from app.core.config import get_settings
+            settings = get_settings()
+            base_url = (getattr(settings, "backend_web_service_url", "") or "http://localhost:8089").rstrip("/")
+            url = f"{base_url}/api/v1/qr-login/internal/relogin/{self.cookie_id}"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"生成续登二维码失败: HTTP {resp.status}")
+                        return None
+                    payload = await resp.json()
+            if not payload.get("success"):
+                logger.warning(f"生成续登二维码失败: {payload.get('message')}")
+                return None
+            return payload.get("data") or {}
+        except Exception as e:
+            logger.error(f"生成续登二维码异常: {self._safe_str(e)}")
+            return None
 
     def _is_normal_token_expiry(self, error_message: str) -> bool:
         """检查是否是正常的令牌过期"""
